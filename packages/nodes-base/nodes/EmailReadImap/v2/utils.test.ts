@@ -289,5 +289,146 @@ describe('Test IMap V2 utils', () => {
 			expect(allBatchedUids[1]).toEqual([21]);
 			expect(staticData.lastMessageUid).toBe(21);
 		});
+
+		/**
+		 * A message that produces no item was never handed to the workflow. The
+		 * watermark is what every later search filters on, so if it moves past
+		 * that message, the message is gone for good: no execution, no error, no
+		 * entry anywhere in the UI (#36681).
+		 */
+		describe('the watermark and a message that made no item', () => {
+			const withHeader = (uid: number) => ({
+				attributes: { uuid: uid, uid, struct: {} },
+				parts: [
+					{ which: 'TEXT', body: 'txt' },
+					{ which: 'HEADER', body: { from: [`user${uid}@test.com`] } },
+				],
+			});
+
+			// The `simple` format skips a message whose HEADER part is missing.
+			const withoutHeader = (uid: number) => ({
+				attributes: { uuid: uid, uid, struct: {} },
+				parts: [{ which: 'TEXT', body: 'txt' }],
+			});
+
+			const runWith = async (staticData: IDataObject, ...batches: unknown[][]) => {
+				triggerFunctions.getNode.mockReturnValue(mock<INode>({ typeVersion: 2.1 }));
+				triggerFunctions.getNodeParameter.calledWith('format').mockReturnValue('simple');
+				triggerFunctions.getNodeParameter.calledWith('downloadAttachments').mockReturnValue(false);
+				triggerFunctions.getWorkflowStaticData.mockReturnValue(staticData);
+
+				const connection = connectionReturning(...batches);
+				await getNewEmails.call(triggerFunctions, {
+					imapConnection: connection,
+					searchCriteria: [],
+					postProcessAction: 'nothing',
+					onEmailBatch: vi.fn(),
+				});
+				return connection;
+			};
+
+			const run = async (staticData: IDataObject, ...batches: unknown[][]) => {
+				triggerFunctions.getNode.mockReturnValue(mock<INode>({ typeVersion: 2.1 }));
+				triggerFunctions.getNodeParameter.calledWith('format').mockReturnValue('simple');
+				triggerFunctions.getNodeParameter.calledWith('downloadAttachments').mockReturnValue(false);
+				triggerFunctions.getWorkflowStaticData.mockReturnValue(staticData);
+
+				const emitted: number[] = [];
+				const onEmailBatch = vi.fn().mockImplementation((data) => {
+					for (const item of data as Array<{ json: { attributes: { uid: number } } }>) {
+						emitted.push(item.json.attributes.uid);
+					}
+				});
+
+				await getNewEmails.call(triggerFunctions, {
+					imapConnection: connectionReturning(...batches),
+					searchCriteria: [],
+					postProcessAction: 'nothing',
+					onEmailBatch,
+				});
+
+				return emitted;
+			};
+
+			it('keeps the watermark below it when it is the last of the batch', async () => {
+				const staticData: IDataObject = {};
+
+				const emitted = await run(staticData, [withHeader(10), withoutHeader(11)]);
+
+				expect(emitted).toEqual([10]);
+				expect(staticData.lastMessageUid).toBe(10);
+			});
+
+			it('keeps the watermark below it even when a later message was emitted', async () => {
+				const staticData: IDataObject = {};
+
+				const emitted = await run(staticData, [withHeader(10), withoutHeader(11), withHeader(12)]);
+
+				expect(emitted).toEqual([10, 12]);
+				// 12 was emitted, but storing it would hide 11 from every later search.
+				expect(staticData.lastMessageUid).toBe(10);
+			});
+
+			it('stops at the lowest skipped message when several are skipped', async () => {
+				const staticData: IDataObject = {};
+
+				await run(staticData, [
+					withHeader(10),
+					withoutHeader(11),
+					withHeader(12),
+					withoutHeader(13),
+				]);
+
+				expect(staticData.lastMessageUid).toBe(10);
+			});
+
+			it('leaves an existing watermark alone rather than lowering it', async () => {
+				const staticData: IDataObject = { lastMessageUid: 50 };
+
+				await run(staticData, [withoutHeader(51)]);
+
+				expect(staticData.lastMessageUid).toBe(50);
+			});
+
+			it('still advances the watermark when every message made an item', async () => {
+				const staticData: IDataObject = {};
+
+				const emitted = await run(staticData, [withHeader(10), withHeader(11)]);
+
+				expect(emitted).toEqual([10, 11]);
+				expect(staticData.lastMessageUid).toBe(11);
+			});
+
+			it('still moves the search window past it', async () => {
+				// The skipped message is the highest of a full page. The next search
+				// must start above it, or the same page comes back for ever.
+				const firstPage = [
+					...Array.from({ length: 19 }, (_, i) => withHeader(i + 2)),
+					withoutHeader(21),
+				];
+
+				const connection = await runWith({}, firstPage, []);
+
+				expect(connection.search).toHaveBeenCalledTimes(2);
+				expect(connection.search.mock.calls[1][0]).toContainEqual(['UID', '21:*']);
+			});
+
+			it('holds the watermark across every page of the same search', async () => {
+				const staticData: IDataObject = {};
+				// A full page, so the search asks for a second one.
+				const firstPage = [
+					withoutHeader(1),
+					...Array.from({ length: 19 }, (_, i) => withHeader(i + 2)),
+				];
+
+				const emitted = await run(staticData, firstPage, [withHeader(21)]);
+
+				// The second page was still fetched and emitted.
+				expect(emitted).toContain(21);
+				// UID 1 made no item, so no watermark is stored at all and the next
+				// search still reaches it.
+				expect(staticData.lastMessageUid).toBeUndefined();
+			});
+		});
 	});
 });

@@ -91,6 +91,10 @@ export async function getNewEmails(
 	let criteria = searchCriteria;
 	let results: Message[] = [];
 	let maxUid = 0;
+	// Keep the stored watermark below the first message that made no item. That
+	// message was never sent to the workflow, and the UID filter of each later
+	// search would hide it permanently (#36681).
+	let lowestSkippedUid: number | undefined;
 
 	do {
 		if (maxUid) {
@@ -112,7 +116,11 @@ export async function getNewEmails(
 			if (message.attributes.uid > maxUid) maxUid = message.attributes.uid;
 
 			const item = await buildItem(message);
-			if (!item) continue;
+			if (!item) {
+				const { uid } = message.attributes;
+				if (lowestSkippedUid === undefined || uid < lowestSkippedUid) lowestSkippedUid = uid;
+				continue;
+			}
 
 			newEmails.push(item);
 			processedUids.push(message.attributes.uid);
@@ -125,8 +133,11 @@ export async function getNewEmails(
 
 		await onEmailBatch(newEmails);
 
-		if (maxUid > ((staticData.lastMessageUid as number) ?? 0)) {
-			staticData.lastMessageUid = maxUid;
+		// `maxUid` keeps its own job: it moves the search window forward. Only the
+		// stored watermark stops below a message that made no item.
+		const watermark = lowestSkippedUid === undefined ? maxUid : lowestSkippedUid - 1;
+		if (watermark > ((staticData.lastMessageUid as number) ?? 0)) {
+			staticData.lastMessageUid = watermark;
 		}
 	} while (results.length >= EMAIL_BATCH_SIZE);
 }
