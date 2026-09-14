@@ -291,12 +291,13 @@ describe('Test IMap V2 utils', () => {
 		});
 
 		/**
-		 * A message that produces no item was never handed to the workflow. The
-		 * watermark is what every later search filters on, so if it moves past
-		 * that message, the message is gone for good: no execution, no error, no
-		 * entry anywhere in the UI (#36681).
+		 * A message that produces no item is never handed to the workflow, but the
+		 * cursor moves past it and every later search filters on
+		 * `UID > lastMessageUid`. It used to be gone for good: no execution, no
+		 * error, no entry anywhere in the UI (#36681). It is now remembered and
+		 * searched again by UID.
 		 */
-		describe('the watermark and a message that made no item', () => {
+		describe('a message that made no item', () => {
 			const withHeader = (uid: number) => ({
 				attributes: { uuid: uid, uid, struct: {} },
 				parts: [
@@ -311,22 +312,6 @@ describe('Test IMap V2 utils', () => {
 				parts: [{ which: 'TEXT', body: 'txt' }],
 			});
 
-			const runWith = async (staticData: IDataObject, ...batches: unknown[][]) => {
-				triggerFunctions.getNode.mockReturnValue(mock<INode>({ typeVersion: 2.1 }));
-				triggerFunctions.getNodeParameter.calledWith('format').mockReturnValue('simple');
-				triggerFunctions.getNodeParameter.calledWith('downloadAttachments').mockReturnValue(false);
-				triggerFunctions.getWorkflowStaticData.mockReturnValue(staticData);
-
-				const connection = connectionReturning(...batches);
-				await getNewEmails.call(triggerFunctions, {
-					imapConnection: connection,
-					searchCriteria: [],
-					postProcessAction: 'nothing',
-					onEmailBatch: vi.fn(),
-				});
-				return connection;
-			};
-
 			const run = async (staticData: IDataObject, ...batches: unknown[][]) => {
 				triggerFunctions.getNode.mockReturnValue(mock<INode>({ typeVersion: 2.1 }));
 				triggerFunctions.getNodeParameter.calledWith('format').mockReturnValue('simple');
@@ -340,66 +325,114 @@ describe('Test IMap V2 utils', () => {
 					}
 				});
 
+				const connection = connectionReturning(...batches);
 				await getNewEmails.call(triggerFunctions, {
-					imapConnection: connectionReturning(...batches),
-					searchCriteria: [],
+					imapConnection: connection,
+					searchCriteria: ['UNSEEN'],
 					postProcessAction: 'nothing',
 					onEmailBatch,
 				});
 
-				return emitted;
+				return { emitted, connection };
 			};
 
-			it('keeps the watermark below it when it is the last of the batch', async () => {
+			it('is remembered instead of being dropped', async () => {
 				const staticData: IDataObject = {};
 
-				const emitted = await run(staticData, [withHeader(10), withoutHeader(11)]);
+				const { emitted } = await run(staticData, [withHeader(10), withoutHeader(11)]);
 
 				expect(emitted).toEqual([10]);
-				expect(staticData.lastMessageUid).toBe(10);
+				expect(staticData.pendingMessageUids).toEqual([11]);
 			});
 
-			it('keeps the watermark below it even when a later message was emitted', async () => {
+			it('does not hold back the cursor, so later messages are not re-sent', async () => {
 				const staticData: IDataObject = {};
 
-				const emitted = await run(staticData, [withHeader(10), withoutHeader(11), withHeader(12)]);
-
-				expect(emitted).toEqual([10, 12]);
-				// 12 was emitted, but storing it would hide 11 from every later search.
-				expect(staticData.lastMessageUid).toBe(10);
-			});
-
-			it('stops at the lowest skipped message when several are skipped', async () => {
-				const staticData: IDataObject = {};
-
-				await run(staticData, [
+				const { emitted } = await run(staticData, [
 					withHeader(10),
 					withoutHeader(11),
 					withHeader(12),
-					withoutHeader(13),
 				]);
 
-				expect(staticData.lastMessageUid).toBe(10);
+				expect(emitted).toEqual([10, 12]);
+				// 12 went out, so the cursor covers it and no later poll repeats it.
+				expect(staticData.lastMessageUid).toBe(12);
+				expect(staticData.pendingMessageUids).toEqual([11]);
 			});
 
-			it('leaves an existing watermark alone rather than lowering it', async () => {
-				const staticData: IDataObject = { lastMessageUid: 50 };
+			it('is searched again by UID on the next poll', async () => {
+				const staticData: IDataObject = { lastMessageUid: 12, pendingMessageUids: [11] };
 
-				await run(staticData, [withoutHeader(51)]);
+				const { emitted, connection } = await run(staticData, [withHeader(11)], []);
 
-				expect(staticData.lastMessageUid).toBe(50);
+				expect(connection.search.mock.calls[0][0]).toEqual(['UNSEEN', ['UID', '11']]);
+				expect(emitted).toEqual([11]);
+				// It was sent this time, so it is no longer pending.
+				expect(staticData.pendingMessageUids).toEqual([]);
 			});
 
-			it('still advances the watermark when every message made an item', async () => {
+			it('stays pending while it still makes no item', async () => {
+				const staticData: IDataObject = { lastMessageUid: 12, pendingMessageUids: [11] };
+
+				const { emitted } = await run(staticData, [withoutHeader(11)], []);
+
+				expect(emitted).toEqual([]);
+				expect(staticData.pendingMessageUids).toEqual([11]);
+			});
+
+			it('is forgotten once it has left the mailbox', async () => {
+				// The retry search returns nothing for it, so there is nothing to wait for.
+				const staticData: IDataObject = { lastMessageUid: 12, pendingMessageUids: [11] };
+
+				await run(staticData, [], []);
+
+				expect(staticData.pendingMessageUids).toEqual([]);
+			});
+
+			it('never grows past the cap, and says which ones it gave up on', async () => {
+				const staticData: IDataObject = {
+					lastMessageUid: 1000,
+					pendingMessageUids: Array.from({ length: 100 }, (_, i) => i + 1),
+				};
+
+				// The retry search still returns all 100, and one more fails after it.
+				await run(
+					staticData,
+					Array.from({ length: 100 }, (_, i) => withoutHeader(i + 1)),
+					[withoutHeader(1001)],
+					[],
+				);
+
+				const pending = staticData.pendingMessageUids as number[];
+				expect(pending).toHaveLength(100);
+				expect(pending.at(-1)).toBe(1001);
+				expect(pending).not.toContain(1);
+				expect(triggerFunctions.logger.warn).toHaveBeenCalledWith(
+					expect.stringContaining('gave up on 1 email'),
+				);
+			});
+
+			it('still advances the cursor when every message made an item', async () => {
 				const staticData: IDataObject = {};
 
-				const emitted = await run(staticData, [withHeader(10), withHeader(11)]);
+				const { emitted } = await run(staticData, [withHeader(10), withHeader(11)]);
 
 				expect(emitted).toEqual([10, 11]);
 				expect(staticData.lastMessageUid).toBe(11);
+				expect(staticData.pendingMessageUids).toEqual([]);
 			});
 
-			it('still moves the search window past it', async () => {
+			it('does not re-send the message the inclusive UID window returns again', async () => {
+				// `['UID', '<cursor>:*']` includes the cursor itself, and the guard in
+				// the loop is what keeps that message from going out twice.
+				const staticData: IDataObject = { lastMessageUid: 10 };
+
+				const { emitted } = await run(staticData, [withHeader(10), withHeader(11)]);
+
+				expect(emitted).toEqual([11]);
+			});
+
+			it('still moves the search window past a skipped message', async () => {
 				// The skipped message is the highest of a full page. The next search
 				// must start above it, or the same page comes back for ever.
 				const firstPage = [
@@ -407,27 +440,10 @@ describe('Test IMap V2 utils', () => {
 					withoutHeader(21),
 				];
 
-				const connection = await runWith({}, firstPage, []);
+				const { connection } = await run({}, firstPage, []);
 
 				expect(connection.search).toHaveBeenCalledTimes(2);
 				expect(connection.search.mock.calls[1][0]).toContainEqual(['UID', '21:*']);
-			});
-
-			it('holds the watermark across every page of the same search', async () => {
-				const staticData: IDataObject = {};
-				// A full page, so the search asks for a second one.
-				const firstPage = [
-					withoutHeader(1),
-					...Array.from({ length: 19 }, (_, i) => withHeader(i + 2)),
-				];
-
-				const emitted = await run(staticData, firstPage, [withHeader(21)]);
-
-				// The second page was still fetched and emitted.
-				expect(emitted).toContain(21);
-				// UID 1 made no item, so no watermark is stored at all and the next
-				// search still reaches it.
-				expect(staticData.lastMessageUid).toBeUndefined();
 			});
 		});
 	});

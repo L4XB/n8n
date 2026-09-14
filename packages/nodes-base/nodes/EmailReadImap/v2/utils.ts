@@ -13,6 +13,9 @@ import rfc2047 from 'rfc2047';
 
 const EMAIL_BATCH_SIZE = 20;
 
+/** How many unreadable messages the node carries forward before it gives up on the oldest. */
+const MAX_PENDING_UIDS = 100;
+
 const FETCH_OPTIONS: Record<string, FetchOptions> = {
 	resolved: { bodies: [''], markSeen: false, struct: true },
 	simple: { bodies: ['TEXT', 'HEADER'], markSeen: false, struct: true },
@@ -88,37 +91,16 @@ export async function getNewEmails(
 
 	const buildItem = itemBuilderFor.call(this, format, imapConnection);
 
-	let criteria = searchCriteria;
-	let results: Message[] = [];
-	let maxUid = 0;
-	// Keep the stored watermark below the first message that made no item. That
-	// message was never sent to the workflow, and the UID filter of each later
-	// search would hide it permanently (#36681).
-	let lowestSkippedUid: number | undefined;
-
-	do {
-		if (maxUid) {
-			criteria = criteria.filter(
-				(criterion) => !Array.isArray(criterion) || !['UID', 'SINCE'].includes(criterion[0]),
-			);
-			criteria.push(['UID', `${maxUid}:*`]);
-		}
-		results = await imapConnection.search(criteria, FETCH_OPTIONS[format] ?? {}, limit);
-
-		this.logger.debug(`Process ${results.length} new emails in node "EmailReadImap"`);
-
+	/** Build items from messages, emit them, and flag only the ones that went out. */
+	const emit = async (messages: Message[]) => {
 		const newEmails: INodeExecutionData[] = [];
 		const processedUids: number[] = [];
+		const skippedUids: number[] = [];
 
-		for (const message of results) {
-			const lastMessageUid = staticData.lastMessageUid as number | undefined;
-			if (lastMessageUid !== undefined && message.attributes.uid <= lastMessageUid) continue;
-			if (message.attributes.uid > maxUid) maxUid = message.attributes.uid;
-
+		for (const message of messages) {
 			const item = await buildItem(message);
 			if (!item) {
-				const { uid } = message.attributes;
-				if (lowestSkippedUid === undefined || uid < lowestSkippedUid) lowestSkippedUid = uid;
+				skippedUids.push(message.attributes.uid);
 				continue;
 			}
 
@@ -132,14 +114,83 @@ export async function getNewEmails(
 		}
 
 		await onEmailBatch(newEmails);
+		return { processedUids, skippedUids };
+	};
 
-		// `maxUid` keeps its own job: it moves the search window forward. Only the
-		// stored watermark stops below a message that made no item.
-		const watermark = lowestSkippedUid === undefined ? maxUid : lowestSkippedUid - 1;
-		if (watermark > ((staticData.lastMessageUid as number) ?? 0)) {
-			staticData.lastMessageUid = watermark;
+	const withoutWindow = (criteria: SearchCriteria[]) =>
+		criteria.filter(
+			(criterion) => !Array.isArray(criterion) || !['UID', 'SINCE'].includes(criterion[0]),
+		);
+
+	// A message that makes no item is never handed to the workflow, but the
+	// cursor still moves past it, and every later search filters on
+	// `UID > lastMessageUid`. Remembering it is what keeps it reachable (#36681).
+	let pendingUids = readPendingUids(staticData);
+	if (pendingUids.length > 0) {
+		const retried = await imapConnection.search(
+			[...withoutWindow(searchCriteria), ['UID', pendingUids.join(',')]],
+			FETCH_OPTIONS[format] ?? {},
+			limit,
+		);
+		const { processedUids } = await emit(retried);
+		// Drop a UID the server no longer returns: it has left the mailbox, and
+		// keeping it would make the list grow for ever.
+		const returned = new Set(retried.map((message) => message.attributes.uid));
+		pendingUids = pendingUids.filter((uid) => returned.has(uid) && !processedUids.includes(uid));
+	}
+
+	let criteria = searchCriteria;
+	let results: Message[] = [];
+	let maxUid = 0;
+
+	do {
+		if (maxUid) {
+			criteria = withoutWindow(criteria);
+			criteria.push(['UID', `${maxUid}:*`]);
+		}
+		results = await imapConnection.search(criteria, FETCH_OPTIONS[format] ?? {}, limit);
+
+		this.logger.debug(`Process ${results.length} new emails in node "EmailReadImap"`);
+
+		const fresh: Message[] = [];
+		for (const message of results) {
+			const lastMessageUid = staticData.lastMessageUid as number | undefined;
+			if (lastMessageUid !== undefined && message.attributes.uid <= lastMessageUid) continue;
+			if (message.attributes.uid > maxUid) maxUid = message.attributes.uid;
+			fresh.push(message);
+		}
+
+		const { skippedUids } = await emit(fresh);
+		pendingUids = capPendingUids.call(this, [...pendingUids, ...skippedUids]);
+
+		if (maxUid > ((staticData.lastMessageUid as number) ?? 0)) {
+			staticData.lastMessageUid = maxUid;
 		}
 	} while (results.length >= EMAIL_BATCH_SIZE);
+
+	staticData.pendingMessageUids = pendingUids;
+}
+
+/** UIDs an earlier poll could not turn into an item, as stored by the node. */
+function readPendingUids(staticData: IDataObject): number[] {
+	const stored = staticData.pendingMessageUids;
+	if (!Array.isArray(stored)) return [];
+	return stored.filter((uid): uid is number => typeof uid === 'number' && Number.isFinite(uid));
+}
+
+/**
+ * Keeps the retry list bounded. A message that can never be built would
+ * otherwise be carried for the life of the workflow, once per poll.
+ */
+function capPendingUids(this: ITriggerFunctions, uids: number[]): number[] {
+	const unique = [...new Set(uids)].sort((a, b) => a - b);
+	if (unique.length <= MAX_PENDING_UIDS) return unique;
+
+	const dropped = unique.slice(0, unique.length - MAX_PENDING_UIDS);
+	this.logger.warn(
+		`Node "EmailReadImap" gave up on ${dropped.length} email(s) it could not read: UID ${dropped.join(', ')}`,
+	);
+	return unique.slice(-MAX_PENDING_UIDS);
 }
 
 function itemBuilderFor(
