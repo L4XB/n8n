@@ -138,6 +138,7 @@ export {
 	roleMappingRuleIdParamSchema,
 	roleSlugParamSchema,
 	userIdParamSchema,
+	userIdentifierParamSchema,
 	variableIdParamSchema,
 	workflowIdParamSchema,
 	workflowVersionIdParamSchema,
